@@ -1,4 +1,3 @@
-/* global $ */
 /**
  * @ignore
  * BEGIN HEADER
@@ -13,68 +12,107 @@
  * END HEADER
  */
 
-const ZettlrRendererIPC = require('./zettlr-rendereripc.js')
-const ZettlrDirectories = require('./zettlr-directories.js')
-const ZettlrPreview = require('./zettlr-preview.js')
-const ZettlrEditor = require('./zettlr-editor.js')
-const ZettlrBody = require('./zettlr-body.js')
-const ZettlrToolbar = require('./zettlr-toolbar.js')
-const ZettlrPomodoro = require('./zettlr-pomodoro.js')
-const ZettlrAttachments = require('./zettlr-attachments.js')
+const ZettlrRendererIPC = require('./zettlr-rendereripc')
+const ZettlrEditor = require('./zettlr-editor')
+const ZettlrBody = require('./zettlr-body')
+const ZettlrToolbar = require('./zettlr-toolbar')
+const ZettlrPomodoro = require('./zettlr-pomodoro')
+const ZettlrSidebar = require('./zettlr-sidebar')
+const GlobalSearch = require('./util/global-search')
 
-const { remote } = require('electron')
-const { clipboard } = require('electron')
+const ZettlrStore = require('./zettlr-store')
 
-const { generateId } = require('../common/zettlr-helpers.js')
+const createFileManager = require('./modules/file-manager').default
 
 const path = require('path')
 
-// Pull the poll-time from the data
-const POLL_TIME = require('../common/data.json').poll_time
+const { ipcRenderer, clipboard } = require('electron')
+
+const generateId = require('../common/util/generate-id')
+const matchFilesByTags = require('../common/util/match-files-by-tags')
+const findObject = require('../common/util/find-object')
+
+const reconstruct = require('./util/reconstruct-tree')
+
+// Service providers
+const PopupProvider = require('./providers/popup-provider')
 
 /**
  * This is the pendant class to the Zettlr class in the main process. It mirrors
  * the functionality of the main process, only that the functionality in here
- * is connected with the rendering, not with the reading of files, etc. This is
- * the only object that is directly referenced from with the index.html file --
- * this is why all the paths in here do not begin in the `renderer` directory,
- * but in the assets directory (which is where the index.htm resides).
+ * is connected with the rendering, not with the reading of files, etc.
  */
 class ZettlrRenderer {
   /**
     * Initialize all dynamic elements in the renderer process
     */
   constructor () {
-    this._currentFile = null
-    this._currentDir = null
-    this._paths = null
-    this._lang = 'en_US' // Default fallback
+    this._lang = 'en-US' // Default fallback
 
-    // Write translation data into renderer process's global var
-    // Why do we have to stringify and parse it? Because otherwise the
-    // renderer's global.i18n-variable will simply be a huge object calling
-    // the main's IPC EVERY TIME it is accessed. Therefore, we take some more
-    // time to copy it completely into the renderer's memory. It will take up
-    // some time at the beginning, but as we are using an overlay either way
-    // it's not gonna impact that much.
-    global.i18n = JSON.parse(JSON.stringify(remote.getGlobal('i18n')))
-
-    // Immediately add the operating system class to the body element to
-    // enable the correct font-family.
-    $('body').addClass(process.platform)
+    // Stores the current global search in order to access it.
+    this._currentSearch = null
 
     // Init the complete list of objects that we need
     this._ipc = new ZettlrRendererIPC(this)
-    this._directories = new ZettlrDirectories(this)
-    this._preview = new ZettlrPreview(this)
     this._editor = new ZettlrEditor(this)
     this._body = new ZettlrBody(this)
     this._toolbar = new ZettlrToolbar(this)
     this._pomodoro = new ZettlrPomodoro(this)
-    this._attachments = new ZettlrAttachments(this)
+    this._sidebar = new ZettlrSidebar(this)
+    // Create and mount the file manager
+    this._fileManager = createFileManager()
+    // Create the store wrapper which will act as
+    // a unifying interface to commit changes to the store.
+    this._store = new ZettlrStore(this, this._fileManager.$store)
 
-    this._directoriesLocked = false // Is the directory tree view currently locked?
-    this._stateBeforeLocked = '' // Saves the state the combiner was in before lock was initialised, can be preview or directories
+    // Add a few convenience functions
+    global.application = {
+      globalSearch: (term) => {
+        // Initiate a global search
+        this._toolbar.setSearch(term)
+        this.beginSearch(term)
+      }
+    }
+
+    // Boot the service providers
+    this._providers = {
+      'popup': new PopupProvider()
+    }
+
+    // This window will be closed if, and only if, there is no tab that can be closed
+    ipcRenderer.on('shortcut', (event, shortcut) => {
+      if (shortcut === 'close-window') {
+        const hasClosedTab = this.getEditor().attemptCloseTab()
+        if (!hasClosedTab) {
+          ipcRenderer.send('window-controls', { command: 'win-close' })
+        }
+      }
+    })
+  }
+
+  /**
+   * Matches the given file with potential candidates based on the used tags.
+   * @param {number} hash The hash of the file to match candidates to.
+   * @returns {Array} An array with potential candidates
+   */
+  matchFile (hash) {
+    if (!hash) {
+      return []
+    }
+
+    let fileDescriptor = this.find(hash)
+
+    if (fileDescriptor === undefined || fileDescriptor.type !== 'file') {
+      return []
+    }
+
+    const items = this._fileManager.$store.state.items
+    return matchFilesByTags(fileDescriptor, items).map(e => {
+      return {
+        'fileDescriptor': this.find(e.hash),
+        'matches': e.matches
+      }
+    })
   }
 
   /**
@@ -86,47 +124,20 @@ class ZettlrRenderer {
     // first tick of the renderer event loop, because at this early stage (init
     // is called right after the DOM has loaded) the ipc is not yet ready. This
     // short delay gives us the time the IPC needs to get ready.
-    setTimeout(() => { this.configChange() }, 10) // 10ms should suffice - the number is irrelevant. The important part is that it's out of the first tick of the app.
-
-    // Requesting the CSS file path obviously also needs to be out of the first
-    // tick.
     setTimeout(() => {
-      // Apply the custom CSS stylesheet to the head element
-      global.ipc.send('get-custom-css-path', {}, (ret) => {
-        let lnk = $('<link>').attr('rel', 'stylesheet')
-        lnk.attr('href', 'file://' + ret + '?' + Date.now())
-        lnk.attr('type', 'text/css')
-        lnk.attr('id', 'custom-css-link')
-        $('head').first().append(lnk)
-      })
-    }, 10)
+      // 10ms should suffice - the number is irrelevant. The important part is
+      // that it's out of the first tick of the app.
+      this.configChange()
 
-    // Receive an initial list of tags to display in the preview list
-    this._ipc.send('get-tags')
-    // Additionally, request the full database of already existing tags inside files.
-    this._ipc.send('get-tags-database')
+      // Request a first batch of files
+      this._ipc.send('get-paths')
 
-    // Request a first batch of files
-    this._ipc.send('get-paths', {})
+      // Send an initial request to the reference database.
+      this._ipc.send('citeproc-get-ids')
+    }, 100)
 
-    // Send an initial request to the reference database.
-    this._ipc.send('citeproc-get-ids')
-
-    // Here we can init actions and stuff to be done after the startup has finished
-    setTimeout(() => { this.poll() }, POLL_TIME) // Poll every POLL_TIME seconds
-
-    // Send an initial check for an update
-    this._ipc.send('update-check')
-  }
-
-  /**
-    * This function is called every POLL_TIME seconds to execute recurring tasks.
-    */
-  poll () {
-    // Nothing to do currently
-
-    // Set next timeout
-    setTimeout(() => { this.poll() }, POLL_TIME)
+    // Initial sidebar refresh
+    this._sidebar.refresh()
   }
 
   /**
@@ -146,31 +157,17 @@ class ZettlrRenderer {
    * and apply them.
    */
   configChange () {
-    // Set dark theme
-    this.darkTheme(global.config.get('darkTheme'))
     // Set file meta
-    this.getPreview().fileMeta(global.config.get('fileMeta'))
-    this.getPreview().hideDirs(global.config.get('hideDirs'))
+    global.store.set('fileMeta', global.config.get('fileMeta'))
+    global.store.set('hideDirs', global.config.get('hideDirs')) // TODO: Not yet implemented
+    global.store.set('displayTime', global.config.get('fileMetaTime'))
+    global.store.set('fileManagerMode', global.config.get('fileManagerMode'))
+    global.store.set('useFirstHeadings', global.config.get('display.useFirstHeadings'))
     // Receive the application language
     this.setLocale(global.config.get('appLang'))
 
-    // Tell the body that the config has changed
-    this.getBody().configChange()
-
     // Tell the editor that the config has changed
     this.getEditor().configChange()
-
-    // Set the correct combiner state
-    switch (global.config.get('combinerState')) {
-      case 'expanded':
-        $('#editor').addClass('collapsed')
-        $('#combiner').addClass('expanded')
-        break
-      case 'collapsed':
-        $('#editor').removeClass('collapsed')
-        $('#combiner').removeClass('expanded')
-        break
-    }
   }
 
   /**
@@ -179,8 +176,8 @@ class ZettlrRenderer {
    * @return {void} Does not return.
    */
   genId () {
-    // First we need to backup the existing clipboard contents so that they are
-    // not lost during the operation.
+    // First we need to backup the existing clipboard contents
+    // so that they are not lost during the operation.
     let text = clipboard.readText()
     let html = clipboard.readHTML()
     let image = clipboard.readImage()
@@ -189,7 +186,7 @@ class ZettlrRenderer {
     // Write an ID to the clipboard
     clipboard.writeText(generateId(global.config.get('zkn.idGen')))
     // Paste the ID
-    remote.getCurrentWebContents().paste()
+    ipcRenderer.send('window-controls', { command: 'paste' })
 
     // Now restore the clipboard's original contents
     setTimeout((e) => {
@@ -211,7 +208,7 @@ class ZettlrRenderer {
     if (arg.hasOwnProperty('hash')) {
       // Another dir should be renamed
       // Rename a dir based on a hash -> find it
-      this._body.requestNewDirName(this.findObject(arg.hash))
+      this._body.requestNewDirName(this.find(arg.hash))
     } else if (this.getCurrentDir() != null) {
       this._body.requestNewDirName(this.getCurrentDir())
     }
@@ -226,21 +223,9 @@ class ZettlrRenderer {
     // User wants to create a new directory. Display modal
     if (arg.hasOwnProperty('hash')) {
       // User has probably right clicked
-      this._body.requestDirName(this.findObject(arg.hash))
+      this._body.requestDirName(this.find(arg.hash))
     } else {
       this._body.requestDirName(this.getCurrentDir())
-    }
-  }
-
-  /**
-    * Tells the ZettlrBody to request a new virtualdir name
-    * @param  {Object} arg Contains the parent dir's hash
-    */
-  newVirtualDir (arg) {
-    if (arg.hasOwnProperty('hash')) {
-      this._body.requestVirtualDirName(this.findObject(arg.hash))
-    } else if (this.getCurrentDir().type === 'directory') { // Only add vds to normal directories
-      this._body.requestVirtualDirName(this.getCurrentDir())
     }
   }
 
@@ -260,27 +245,10 @@ class ZettlrRenderer {
   }
 
   /**
-   * Set the dark theme of the app based upon the value of val.
-   * @param  {Boolean} val Whether or not we should enable the dark theme.
+   * Toggle the sidebar
    */
-  darkTheme (val) {
-    this._body.darkTheme(val)
-  }
-
-  /**
-    * Toggle the display of the directory pane.
-    * @return {void} No return.
-    */
-  toggleCombiner () {
-    $('#combiner').hide() // bruh
-    this._editor.toggleCombiner() // Need a better name for this thing. Definitely.
-  }
-
-  /**
-    * Toggles display of the attachment pane.
-    */
-  toggleAttachments () {
-    this._attachments.toggle()
+  toggleSidebar () {
+    this._sidebar.toggle()
   }
 
   /**
@@ -288,36 +256,9 @@ class ZettlrRenderer {
     * @param  {Number} hash The hash to be searched for
     * @return {Object}      Either a file or a directory object
     */
-  findObject (hash) {
-    let o = null
-    for (let p of this._paths) {
-      o = this._find(hash, p)
-      if (o != null) {
-        break
-      }
-    }
-
-    return o
-  }
-
-  /**
-    * Helper function to find dummy file/dir objects based on a hash
-    * @param  {Integer} hash             The hash identifying whatever is to be searched for.
-    * @param  {Object} [obj=this._paths] A sub-object or the whole tree to be searched.
-    * @return {Mixed}                  Either null, or ZettlrFile/ZettlrDir if found.
-    */
-  _find (hash, obj = this._paths) {
-    if (parseInt(obj.hash) === parseInt(hash)) {
-      return obj
-    } else if (obj.hasOwnProperty('children')) {
-      for (let c of obj.children) {
-        let ret = this._find(hash, c)
-        if (ret != null) {
-          return ret
-        }
-      }
-    }
-    return null
+  find (hash) {
+    const items = this._fileManager.$store.state.items
+    return findObject(items, 'hash', hash, 'children')
   }
 
   /**
@@ -327,22 +268,28 @@ class ZettlrRenderer {
     * @return {void}       Nothing to return.
     */
   refresh (nData) {
-    this._paths = nData
+    // First we have to "reconstruct" the circular structure
+    // of the directory tree. This function replaces each
+    // parent-prop (only a hash) with the corresponding tree
+    // object, so that we have in principle the same structure
+    // than in main.
+    reconstruct(nData)
+
+    // Pass on the new paths object as is to the store.
+    global.store.renewItems(nData)
+
+    // Trigger a refresh for all affected places
+    this._sidebar.refresh()
+    this._editor.signalUpdateFileAutocomplete()
+
+    // NOTE: We have to set the directory last because it will re-execute a
+    // potential search, leading to an error if the store, e.g., does not
+    // have the correct list of files.
     if (this.getCurrentDir() != null) {
       this.setCurrentDir(this.getCurrentDir().hash)
     } else {
       this.setCurrentDir(null) // Reset
     }
-    if (this.getCurrentFile() != null) {
-      this.setCurrentFile(this.getCurrentFile().hash)
-    } else {
-      this.setCurrentFile(null)
-    }
-
-    // Trigger a refresh in directories and preview and attachment pane
-    this._directories.refresh()
-    this._preview.refresh()
-    this._attachments.refresh()
   }
 
   /**
@@ -350,12 +297,12 @@ class ZettlrRenderer {
     * @param  {ZettlrFile} file The new file object.
     */
   refreshCurrentFile (file) {
-    if (this.getCurrentFile()) {
+    let f = this.getActiveFile()
+    if (f) {
       // The only things that could've changed and that are immediately
       // visible to the user (which is why we need to update them) are:
       // modtime, file meta, tags, id. The rest can wait until the next big
       // update.
-      let f = this.getCurrentFile()
       f.modtime = file.modtime
       f.tags = file.tags
       f.wordCount = file.wordCount
@@ -364,6 +311,12 @@ class ZettlrRenderer {
       f.id = file.id
       // Trigger a redraw of this specific file in the preview list.
       this._preview.refresh()
+
+      // Also, the bibliography has likely changed
+      this._sidebar.refreshBibliography(this._editor.getValue())
+
+      // Finally, synchronize the file descriptors in the editor
+      this._editor.syncFiles()
     }
   }
 
@@ -373,29 +326,39 @@ class ZettlrRenderer {
     * @param  {ZettlrFile} file    The new file to replace the old.
     */
   replaceFile (oldHash, file) {
-    if (!file) {
-      return // No file given; main has screwed up
-    }
+    if (!file) return // No file given; main has screwed up
 
-    let oldFile = this.findObject(oldHash)
+    let oldFile = this.find(oldHash)
 
     if (oldFile && oldFile.type === 'file') {
-      // Apply all necessary properties
-      oldFile.dir = file.dir
-      oldFile.name = file.name
-      oldFile.path = file.path
-      oldFile.hash = file.hash
-      oldFile.id = file.id
-      oldFile.tags = file.tags
-      oldFile.target = file.target
-      oldFile.wordCount = file.wordCount
-      oldFile.charCount = file.charCount
-      oldFile.ext = file.ext
-      oldFile.modtime = file.modtime
+      // We'll be patching the store, as this will
+      // be reflected in renderer._paths as well.
+      global.store.patch(oldHash, file)
 
-      // Then refresh
-      this._preview.refresh()
-      this._directories.refresh()
+      // Finally, synchronize the file descriptors in the editor
+      this._editor.syncFiles()
+    }
+  }
+
+  /**
+    * Replaces a directory after the name has changed (or it has been moved)
+    * @param  {Number} oldHash The old hash
+    * @param  {ZettlrDir} dir    The new dir to replace the old.
+    */
+  replaceDir (oldHash, dir) {
+    if (!dir) return // No file given; main has screwed up
+
+    let oldDir = this.find(oldHash)
+
+    if (oldDir && oldDir.type === 'directory') {
+      let tempParent = dir.parent
+      reconstruct(dir) // Reconstruct may overwrite the parent with null
+      dir.parent = this.find(tempParent)
+
+      // We'll be patching the store, as this
+      // will also update the renderer._paths.
+      global.store.patch(oldHash, dir)
+      this._sidebar.refresh()
     }
   }
 
@@ -403,53 +366,70 @@ class ZettlrRenderer {
   // This class only acts as a pass-through
 
   /**
-   * This function can be used to programmatically start a global search. It
-   * takes care that the toolbar shows the correct search term and that the
-   * search is initiated.
-   * @param  {String} term A term in string form
-   * @return {ZettlrRenderer} This for chainability.
-   */
-  triggerGlobalSearch (term) {
-    this._toolbar.setSearch(term)
-    this.beginSearch(term)
-    return this
-  }
-
-  /**
    * This function is called by ZettlrToolbar. The term gets passed on to
    * ZettlrPreview, but also a force-open event is sent to main, in case there
    * is a file that completely matches the file name.
-   * @param  {String} term The term to be searched for.
-   * @return {void}      Nothing to return.
+   *
+   * @param   {string}   term           The term to be searched for.
    */
-  beginSearch (term) {
-    // Show preview before searching the dir
-    this.showPreview()
-    this._ipc.send('force-open', term)
-    this._preview.beginSearch(term)
+  beginSearch (term, attemptToOpen = true) {
+    // If there is a search running, set the interrupt flag
+    if (this._currentSearch) this._currentSearch.setInterrupt()
+
+    // First end any search in the store, if applicable.
+    global.store.commitEndSearch()
+
+    if (attemptToOpen) {
+      this._ipc.send('force-open-if-exists', term)
+    }
+
+    // Now perform the actual search. For this we'll create a new search
+    // object and pass all necessary data to it.
+    let dirContents = this._fileManager.$store.getters.currentDirectoryContent
+    this._currentSearch = new GlobalSearch(term)
+    this._currentSearch.with(
+      // Filter by file and then only retain the hashes
+      dirContents.filter(elem => elem.type === 'file').map(elem => elem.hash)
+    ).each((elem, compiledSearchTerms) => {
+      return new Promise((resolve, reject) => {
+        // Send a request to the main process and handle it afterwards.
+        global.ipc.send('file-search', {
+          'hash': elem,
+          'terms': compiledSearchTerms
+        })
+
+        // Now listen for the return
+        global.ipc.once('file-search-result', (data) => {
+          // Once the data comes back from main, resolve the promise
+          resolve(data)
+          // Also commit the search result to the store
+          global.store.commitSearchResult(data)
+        })
+      })
+    }).afterEach((count, total) => {
+      this.searchProgress(count, total)
+    }).then((res) => {
+      // Indicate no results, if applicable.
+      if (res.length === 0) global.store.emptySearchResult()
+      // Mark the results in the potential open file
+      global.editorSearch.markResults(this.getActiveFile())
+      this._toolbar.endSearch() // Mark the search as finished
+    }).start()
   }
 
   /**
    * Initiates an auto-search that either directly opens a file (forceOpen=true)
    * or simply automatically searches for something and displays the results.
+   *
    * @param  {String} term The content of the Wikilink or Tag that has been clicked
-   * @param {Boolean} [forceOpen=false] If true, Zettlr will directly open the file
    */
-  autoSearch (term, forceOpen = false) {
-    if (!forceOpen) {
-      // Insert the term into the search field and commence search.
-      this._toolbar.setSearch(term)
-      this.beginSearch(term)
-    } else {
-      // Show preview before searching the dir
-      this.showPreview()
-      // Don't search, simply tell main to open the file
-      this._ipc.send('force-open', term)
-      // Also initiate a search to be run accordingly for any files that
-      // might reference the file.
-      this._toolbar.setSearch(term)
-      this.beginSearch(term)
-    }
+  autoSearch (term) {
+    // Also initiate a search to be run accordingly for any files that
+    // might reference the file.
+    this._toolbar.setSearch(term)
+    // Never attempt to open during autoSearch, because autoSearch is only called
+    // when a Zettelkasten link is opened.
+    this.beginSearch(term, false)
   }
 
   /**
@@ -461,12 +441,11 @@ class ZettlrRenderer {
   searchProgress (curIndex, count) { this._toolbar.searchProgress(curIndex, count) }
 
   /**
-   * Pass-through function from ZettlrPreview to Toolbar.
-   * @return {void} Nothing to return.
+   * Exits the search, i.e. resets everything back to what it looked like.
    */
-  endSearch () {
-    this._toolbar.endSearch()
-    this._preview.endSearch()
+  exitSearch () {
+    global.store.commitEndSearch()
+    global.editorSearch.unmarkResults()
   }
 
   // END search functions
@@ -481,62 +460,50 @@ class ZettlrRenderer {
 
   /**
    * Pass-through function from ZettlrEditor to ZettlrToolbar.
-   * @param  {Integer} words Number of words in editor.
+   * @param  {Object} fileInfo fileInfo object.
    * @return {void}       Nothing to return.
    */
-  updateWordCount (words) { this._toolbar.updateWordCount(words) }
+  updateFileInfo (fileInfo) { this._toolbar.updateFileInfo(fileInfo) }
 
   /**
-   * Request the selection of the directory in main.
-   * @param  {Integer} hash As usually, a hash identifying a directory.
-   * @return {void}      Nothing to return.
+   * Updates the table of contents in the sidebar
+   *
+   * @param   {Object}  tableOfContents  The table of contents
    */
-  requestDir (hash) {
-    // Only request a new directory if it is about to be changed.
-    if (this.getCurrentDir() == null || this.getCurrentDir().hash !== parseInt(hash)) {
-      this._ipc.send('dir-select', hash)
-    } else {
-      // Otherwise, the user simply has clicked on the dir again to show
-      // the preview list.
-      this.showPreview()
-    }
-  }
+  updateTOC (tableOfContents) { this._sidebar.updateTOC(tableOfContents) }
 
   /**
    * Opens a new file
-   * @param  {ZettlrFile} f The file to be opened
+   * @param  {ZettlrFile} f       The file to be opened
+   * @param {Boolean}     isSync  If this is a synchronization request
    */
-  openFile (f) {
+  openFile (f, isSync = false) {
+    if (f.hasOwnProperty('flag')) {
+      // We have a flag, so we need to extract the file
+      // flag = f.flag
+      f = f.file
+    }
     // We have received a new file. So close the old and open the new
-    this._editor.close()
     // Select the file either in the preview list or in the directory tree
-    this._preview.select(f.hash)
-    this._editor.open(f)
+    global.store.set('selectedFile', f.hash)
+    this._editor.open(f, isSync)
+  }
+
+  /**
+   * Called by the editor or this to indicate that the activeFile has changed.
+   */
+  signalActiveFileChanged () {
+    // Also, the bibliography has likely changed
+    this._sidebar.refreshBibliography(this._editor.getValue())
   }
 
   /**
    * Closes the current file
+   * @param {number} hash The hash of the file to be closed.
    */
-  closeFile () {
+  closeFile (hash = null) {
     // We have received a close-file command.
-    this._editor.close()
-  }
-
-  /**
-   * Saves the current file
-   */
-  saveFile () {
-    // The user wants to save the currently opened file.
-    let file = this.getCurrentFile()
-    if (file == null) {
-      // User wants to save an untitled file
-      // Important: The main Zettlr-class expects hash to be null
-      // for new files
-      file = {}
-    }
-    file.content = this._editor.getValue()
-    file.wordcount = this._editor.getWrittenWords() // For statistical purposes only =D
-    this._ipc.send('file-save', file)
+    this._editor.close(hash)
   }
 
   /**
@@ -546,12 +513,11 @@ class ZettlrRenderer {
   renameFile (f) {
     if (f.hasOwnProperty('hash')) {
       // Make sure preview is visible for this to work correctly
-      this.showPreview()
       // Another file should be renamed
       // Rename a file based on a hash -> find it
-      this._body.requestNewFileName(this.findObject(f.hash))
-    } else if (this.getCurrentFile() != null) {
-      this._body.requestNewFileName(this.getCurrentFile())
+      this._body.requestNewFileName(this.find(f.hash))
+    } else if (this.getActiveFile() != null) {
+      this._body.requestNewFileName(this.getActiveFile())
     }
   }
 
@@ -563,18 +529,14 @@ class ZettlrRenderer {
     // User wants to create a new file. Display popup
     if ((d != null) && d.hasOwnProperty('hash')) {
       // User has probably right clicked
-      this._body.requestFileName(this.findObject(d.hash))
+      this._body.requestFileName(this.find(d.hash))
+    } else if (d === 'new-file-button') {
+      // The user has requested a new file from the new file button
+      // on the tab bar - so let's display it there
+      this._body.requestFileName(this.getCurrentDir(), 'new-file-button')
     } else {
       this._body.requestFileName(this.getCurrentDir())
     }
-  }
-
-  /**
-   * Exits the search, i.e. resets everything back to what it looked like.
-   */
-  exitSearch () {
-    this._preview.showFiles()
-    this._editor.unmarkResults()
   }
 
   /**
@@ -582,58 +544,40 @@ class ZettlrRenderer {
    * @param {ZettlrDir} newdir The new dir.
    */
   setCurrentDir (newdir = null) {
-    let oldDir = this._currentDir
-    this._currentDir = this.findObject(newdir) // Find the dir (hash) in our own paths object
-    this._attachments.refresh()
-
-    if (this._currentDir != null) {
-      // What we can also do here: Select the dir and refresh the file list.
-      // Because that's what _always_ follows this function call.
-      this._directories.select(newdir)
-      if ((oldDir != null) && (oldDir.path !== newdir.path)) {
-        // End (potential) displaying of file results. showFiles() also refreshes.
-        this.exitSearch()
-      } else {
-        // Else don't exit the search
-        this._preview.refresh()
-      }
-
-      if (this.getCurrentFile()) {
-        // Necessary to scroll the file into view
-        this._preview.select(this.getCurrentFile().hash)
-      }
-      if (oldDir == null || this._currentDir.hash !== oldDir.hash) {
-        this.showPreview()
-      } // Else stay where we are
-    } else {
-      this.showDirectories()
+    // We need to query this before altering the state, as otherwise it'll
+    // report that there is no active search.
+    let hasActiveSearch = Boolean(global.store.hasActiveSearch())
+    global.store.selectDirectory(newdir)
+    this._sidebar.refresh()
+    this._editor.signalUpdateFileAutocomplete() // On every directory change
+    // "Re-do" the search
+    if (hasActiveSearch) {
+      this.beginSearch(this._toolbar.getSearchTerm())
     }
   }
 
   /**
-   * Simply sets the current file pointer to the new.
-   * @param {Number} newHash The new file's hash.
-   */
-  setCurrentFile (newHash) {
-    this._currentFile = this.findObject(newHash)
-    // Also directly select it
-    if (this._currentFile !== null) {
-      this._preview.select(newHash)
-      this._directories.select(newHash)
-    }
-  }
-
-  /**
-   * Returns the current file's pointer.
+   * Get the active file from the editor
    * @return {ZettlrFile} The file object.
    */
-  getCurrentFile () { return this._currentFile }
+  getActiveFile () {
+    let activeFile = this._editor.getActiveFile()
+    if (activeFile === undefined) {
+      return undefined
+    }
+
+    // Don't return the editor's object (with all
+    // content etc) but our own's without content!
+    return this.find(activeFile.hash)
+  }
 
   /**
    * Returns the current directory's pointer.
    * @return {ZettlrDir} The dir object.
    */
-  getCurrentDir () { return this._currentDir }
+  getCurrentDir () {
+    return this.find(this._fileManager.$store.state.selectedDirectory)
+  }
 
   /**
    * Sets the GUI language
@@ -654,18 +598,6 @@ class ZettlrRenderer {
   getEditor () { return this._editor }
 
   /**
-   * Returns the preview object
-   * @return {ZettlrPreview} The preview list
-   */
-  getPreview () { return this._preview }
-
-  /**
-   * Returns the directories object
-   * @return {ZettlrDirectories} The directory object
-   */
-  getDirectories () { return this._directories }
-
-  /**
    * Returns the body object
    * @return {ZettlrBody} The body instance
    */
@@ -678,16 +610,16 @@ class ZettlrRenderer {
   getPomodoro () { return this._pomodoro }
 
   /**
-   * Returns the current paths
-   * @return {Object} The paths object
-   */
-  getPaths () { return this._paths }
-
-  /**
    * Returns the stats view
    * @return {ZettlrStatsView} The view instance
    */
   getStatsView () { return this._stats }
+
+  /**
+   * Returns the file manager component
+   * @return {VueComponent} The file manager
+   */
+  getFileManager () { return this._fileManager }
 
   /**
    * Returns a one-dimensional array of all files in the current directory and
@@ -715,47 +647,6 @@ class ZettlrRenderer {
   }
 
   /**
-   * Shows directory pane in combiner
-   */
-  showDirectories () {
-    this._preview.hide()
-    this._directories.show()
-  }
-
-  /**
-   * Shows preview in combiner
-   */
-  showPreview () {
-    if (this._directoriesLocked) {
-      return // Can't show the preview pane
-    }
-    this._preview.show()
-    this._directories.hide()
-  }
-
-  /**
-   * Lock the directories so that preview won't show up
-   */
-  lockDirectories () {
-    this._directoriesLocked = true
-    // Get previous state
-    this._stateBeforeLocked = ($('#preview').hasClass('hidden')) ? 'directories' : 'preview'
-    // Also make sure directories are shown
-    this.showDirectories()
-  }
-
-  /**
-     * Unlocks the directory pane, e.g. preview can be shown again
-     */
-  unlockDirectories () {
-    this._directoriesLocked = false
-    // Restore preview, if it was shown before the directories were locked.
-    if (this._stateBeforeLocked === 'preview') {
-      this.showPreview()
-    }
-  }
-
-  /**
    * Updates the list of IDs available for autocomplete
    * @param {Array} idList An array containing all available IDs.
    */
@@ -766,12 +657,17 @@ class ZettlrRenderer {
    * update it here.
    * @param {Object} bib A new citeproc bibliography object.
    */
-  setBibliography (bib) { this._attachments.refreshBibliography(bib) }
+  setBibliography (bib) { this._sidebar.setBibliographyContents(bib) }
 
   /**
    * Simply indicates to main to set the modified flag.
    */
-  setModified () { this._ipc.send('file-modified', {}) }
+  setModified (hash) { this._ipc.send('file-modified', { 'hash': hash }) }
+
+  /**
+   * Instructs main to remove the edit flag.
+   */
+  clearModified (hash) { this._ipc.send('mark-clean', { 'hash': hash }) }
 
   /**
    * Can tell whether or not the editor is modified.

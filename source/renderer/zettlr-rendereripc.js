@@ -10,13 +10,11 @@
 * Description:     Handles communication with the main process. There are
 *                  three channels that are used for communication:
 *                  - message: The default channel for most of the stuff (async)
-*                  - config: Retrieve configuration values (sync)
-*                  - typo: Retrieve dictionary functions (sync)
 *
 * END HEADER
 */
 
-const { trans } = require('../common/lang/i18n.js')
+const { trans } = require('../common/i18n.js')
 const { clipboard } = require('electron')
 const ipc = require('electron').ipcRenderer
 
@@ -27,6 +25,7 @@ const CLOSING_COMMANDS = [
   'file-get',
   'file-new',
   'file-delete',
+  'file-rename', // No visible closing, but files are being swapped under the hood
   'close-root',
   'force-open',
   'win-close',
@@ -58,63 +57,40 @@ class ZettlrRendererIPC {
         }
       }
 
+      // Now check if there are any once-callbacks listed
+      for (let cb of this._onceCallbacks) {
+        if (cb.message === arg.command) {
+          // Call the callback and remove from the array
+          cb.callback(arg.content)
+          this._onceCallbacks.splice(this._onceCallbacks.indexOf(cb), 1)
+          return
+        }
+      }
+
       // Dispatch the message further down the array.
       this.dispatch(arg)
     })
 
     this._bufferedMessage = null
     this._callbackBuffer = {}
-
-    // This is an object that will hold all previously checked words in the form
-    // of word: correct?
-    // We are explicitly omitting the prototype stuff, as we don't access this.
-    this._invalidateDictionaryBuffer()
-    this._typoCheck = false
-    // Activate typocheck after 2 seconds to speed up the app's start
-    setTimeout(() => { this._typoCheck = true }, 2000)
-
-    // What we are doing here is setting up a special communications channel
-    // with the main process to receive config values. This way it is much
-    // easier to access the configuration from throughout the whole renderer
-    // process.
-    global.config = {
-      get: (key) => {
-        if (typeof key !== 'string') {
-          console.error('Cannot request config value - key was not a string.')
-          return undefined // On error return undefined
-        }
-        // We will send a synchronous event to the main process in order to
-        // immediately receive the config value we need. Basically we are pulling
-        // the get()-handler from main using the "remote" feature, but we'll
-        // implement it ourselves.
-        return ipc.sendSync('config', key)
-      }
-    }
-
-    // Inject typo spellcheck and suggest functions into the globals
-    global.typo = {
-      check: (term) => {
-        if (!this._typoCheck) return true // Give the dictionaries some time to heat up
-        // Return cache if possible
-        if (this._typoCache[term] !== undefined) return this._typoCache[term]
-        // Save into the corresponding cache and return the query result
-        // Return the query result
-        let correct = ipc.sendSync('typo', { 'type': 'check', 'term': term })
-        if (correct === 'not-ready') return true // Don't check unless its ready
-        this._typoCache[term] = correct
-        return correct
-      },
-      suggest: (term) => {
-        return ipc.sendSync('typo', { 'type': 'suggest', 'term': term })
-      }
-    }
+    this._onceCallbacks = []
 
     // Sends an array of IDs to main. If they are found in the JSON, cool! Otherwise
     // this will return false.
     global.citeproc = {
-      getCitation: (idList) => { return ipc.sendSync('getCitation', idList) },
-      updateItems: (idList) => { return ipc.sendSync('updateItems', idList) },
-      makeBibliography: () => { this.send('citeproc-make-bibliography') }
+      getCitation: (citation) => {
+        return ipc.sendSync('cite', {
+          'type': 'get-citation',
+          'content': citation
+        })
+      },
+      updateItems: (keyList) => {
+        return ipc.sendSync('cite', {
+          'type': 'update-items',
+          'content': keyList
+        })
+      },
+      makeBibliography: () => { ipc.send('cite', { 'type': 'make-bibliography' }) }
     }
 
     global.ipc = {
@@ -147,6 +123,18 @@ class ZettlrRendererIPC {
         this._callbackBuffer[cypher] = callback
         // Send!
         ipc.send('message', payload)
+      },
+      /**
+       * Registers a callback for a one-time message callback.
+       * @param  {String}   message  The message to which this callback applies
+       * @param  {Function} callback The provided callback
+       * @return {void}            Does not return.
+       */
+      once: (message, callback) => {
+        this._onceCallbacks.push({
+          'message': message,
+          'callback': callback
+        })
       }
     }
   }
@@ -183,7 +171,7 @@ class ZettlrRendererIPC {
         'content': arg
       }
 
-      this._app.saveFile()
+      this._app.getEditor().saveFiles() // Save all files just in case
       return
     }
 
@@ -191,15 +179,6 @@ class ZettlrRendererIPC {
       'command': command,
       'content': arg
     })
-  }
-
-  /**
-   * Invalidates the complete dictionary buffer. Necessary to retrieve accurate
-   * messages whenever the dictionaries change during runtime.
-   * @return {void} Does not return.
-   */
-  _invalidateDictionaryBuffer () {
-    this._typoCache = Object.create(null)
   }
 
   /**
@@ -245,7 +224,7 @@ class ZettlrRendererIPC {
 
       // Print the current file
       case 'print':
-        this.send('print')
+        this.send('print', { 'hash': this._app.getActiveFile().hash })
         break
 
       // The context menu triggers this action, so send it to the main process.
@@ -270,14 +249,20 @@ class ZettlrRendererIPC {
         this._app.setCurrentDir(cnt)
         break
 
+      // TODO: What the heck is that a kind of "name"?
       case 'dir-find':
       // User wants to search in current directory.
         this._app.getToolbar().focusSearch()
         break
 
-      case 'dir-open':
+      case 'workspace-open':
       // User has requested to open another folder. Notify host process.
-        this.send('dir-open')
+        this.send('workspace-open')
+        break
+
+      case 'root-file-open':
+        // User wants to open a new root file
+        this.send('root-file-open')
         break
 
       case 'dir-rename':
@@ -290,10 +275,6 @@ class ZettlrRendererIPC {
 
       case 'dir-delete':
         this._app.deleteDir(cnt)
-        break
-
-      case 'dir-new-vd':
-        this._app.newVirtualDir(cnt)
         break
 
       // Make a project from a directory
@@ -318,31 +299,70 @@ class ZettlrRendererIPC {
         this.send('dir-project-export', cnt)
         break
 
+      // Copy the current file's ID to the clipboard
+      case 'copy-current-id':
+        try {
+          require('electron').clipboard.writeText(this._app.getActiveFile().id)
+        } catch (e) {
+          // Obviously no ID ...
+        }
+        break
+
+      // Closes a root file or directory
       case 'root-close':
-        this.send('close-root', cnt.hash)
+        this.send('root-close', cnt.hash)
         break
 
         // FILES
 
-      case 'file-set-current':
-        this._app.setCurrentFile(cnt)
+      case 'file-request-sync':
+        // Indicate with "true" that it should open the file in background
+        this._app.openFile(cnt, true)
         break
-
       case 'file-open':
         this._app.openFile(cnt)
         break
 
+      case 'announce-transient-file':
+        global.editor.announceTransientFile(cnt.hash)
+        break
+
       case 'file-close':
-        this._app.closeFile()
+        this._app.closeFile(cnt.hash)
+        break
+
+      case 'file-close-all':
+        this.send('file-close-all')
         break
 
       case 'file-save':
-        this._app.saveFile()
+        this._app.getEditor().saveFiles(true) // true means only save active file
         break
 
       // Replace all properties of a file (e.g. on rename)
       case 'file-replace':
         this._app.replaceFile(cnt.hash, cnt.file)
+        break
+
+      // Is used to hot-swap the contents of a currently opened file
+      case 'replace-file-contents':
+        this._app.getEditor().replaceFileContents(cnt.hash, cnt.contents)
+        break
+
+      case 'sync-files':
+        this._app.getEditor().syncFiles(cnt)
+        break
+
+        // case 'file-request-sync':
+        //   // NOTE: We're now perfoming the same action as file-open
+        //   // This is the answer from main with a file and its contents which
+        //   // we simply need to add to the open files
+        //   this._app.getEditor().addFileToOpen(cnt)
+        //   break
+
+      // Replace a full directory tree (e.g., on rename or modification of the children)
+      case 'dir-replace':
+        this._app.replaceDir(cnt.hash, cnt.dir)
         break
 
       // Show the popup to set a file's target
@@ -351,7 +371,7 @@ class ZettlrRendererIPC {
         break
 
       case 'mark-clean':
-        this._app.getEditor().markClean()
+        this._app.getEditor().markClean(cnt.hash)
         // If we have a buffered message, send that and afterwards clean up
         if (this._bufferedMessage != null) {
           this.send(this._bufferedMessage.command, this._bufferedMessage.content)
@@ -367,8 +387,8 @@ class ZettlrRendererIPC {
         this._app.newFile(cnt)
         break
 
-      case 'file-find':
-        this._app.getBody().displayFind()
+      case 'file-duplicate':
+        this._app.getBody().requestDuplicate(cnt)
         break
 
       case 'file-delete':
@@ -377,18 +397,8 @@ class ZettlrRendererIPC {
         if (cnt.hasOwnProperty('hash')) {
           this.send('file-delete', { 'hash': cnt.hash })
         } else {
-          this.send('file-delete', {})
+          this.send('file-delete', { 'hash': this._app.getActiveFile().hash })
         }
-        break
-
-      case 'file-delete-from-vd':
-        if (cnt.hasOwnProperty('hash') && cnt.hasOwnProperty('virtualdir')) {
-          this.send('file-delete-from-vd', cnt)
-        }
-        break
-
-      case 'file-search-result':
-        this._app.getPreview().handleSearchResult(cnt)
         break
 
       // Toggle theme or file meta, main will automatically trigger a configuration change.
@@ -405,25 +415,17 @@ class ZettlrRendererIPC {
         this._app.getToolbar().toggleDistractionFree()
         break
 
-      case 'toggle-directories':
-        if (this._app.getDirectories().isHidden()) {
-          this._app.showDirectories()
-        } else {
-          this._app.showPreview()
-        }
+      case 'toggle-typewriter-mode':
+        this._app.getEditor().toggleTypewriterMode()
         break
 
-      case 'toggle-preview':
-        if (this._app.getPreview().isHidden()) {
-          this._app.showPreview()
-        } else {
-          this._app.showDirectories()
-        }
+      case 'toggle-file-manager':
+        this._app.getFileManager().toggleFileList()
         break
 
       case 'export':
-        if (this._app.getCurrentFile() != null) {
-          this._app.getBody().displayExport(this._app.getCurrentFile())
+        if (this._app.getActiveFile() != null) {
+          this._app.getBody().displayExport(this._app.getActiveFile())
         }
         break
 
@@ -440,14 +442,6 @@ class ZettlrRendererIPC {
         this.send('get-pdf-preferences')
         break
 
-      case 'open-tags-preferences':
-        this.send('get-tags-preferences')
-        break
-
-      case 'open-custom-css':
-        this._app.getBody().displayCustomCss()
-        break
-
       case 'preferences':
         this._app.getBody().displayPreferences(cnt)
         break
@@ -460,13 +454,12 @@ class ZettlrRendererIPC {
         this._app.getBody().displayTagsPreferences(cnt)
         break
 
-      case 'set-tags':
-        this._app.getPreview().setTags(cnt)
+      case 'inspect-clipboard':
+        this._app.getBody().displayDevClipboard()
         break
 
-      // Update the editor's tag database
-      case 'tags-database':
-        this._app.getEditor().setTagDatabase(cnt)
+      case 'set-tags':
+        global.store.set('tags', cnt)
         break
 
       // Display the informative tag cloud
@@ -487,14 +480,9 @@ class ZettlrRendererIPC {
         this._app.getBody().displayFormatting()
         break
 
-      // Small notification
-      case 'notify':
-        global.notify(cnt)
-        break
-
-      // Dedicated dialog window for the error
-      case 'notify-error':
-        global.notifyError(cnt)
+      // Toggle the editor's readability-mode on or off.
+      case 'toggle-readability':
+        this._app.getEditor().toggleReadability()
         break
 
       case 'toc':
@@ -506,42 +494,22 @@ class ZettlrRendererIPC {
         this._app.getPomodoro().popup()
         break
 
-      // Zoom
-      case 'zoom-reset':
-        this._app.getEditor().zoom(0) // <-- Sometimes I think I am stupid. Well, but it works, I guess.
-        break
-      case 'zoom-in':
-        this._app.getEditor().zoom(1)
-        break
-      case 'zoom-out':
-        this._app.getEditor().zoom(-1)
-        break
-
-      // Updater
-      case 'update-check':
-        this.send('update-check')
-        break
-
-      case 'update-available':
-        this._app.getBody().displayUpdate(cnt)
-        break
-
       // About dialog
       case 'display-about':
         this._app.getBody().displayAbout()
         break
 
-      case 'toggle-attachments':
-        this._app.toggleAttachments()
+      case 'select-icon':
+        this._app.getBody().displayIconSelect(cnt)
+        break
+
+      case 'toggle-sidebar':
+        this._app.toggleSidebar()
         break
 
       // Stats
       case 'show-stats':
-        this.send('request-stats-data')
-        break
-
-      case 'stats-data':
-        this._app.getBody().displayStats(cnt)
+        this._app.getBody().displayStats()
         break
 
       // Generate a new ID
@@ -562,6 +530,10 @@ class ZettlrRendererIPC {
       // Import files and folders
       case 'import-files':
         this.send('import-files')
+        break
+
+      case 'show-in-finder':
+        this._app.showInFinder(cnt)
         break
 
       // Copy a selection as HTML
@@ -595,11 +567,15 @@ class ZettlrRendererIPC {
         this._app.getBody().displayPasteImage()
         break
 
-      // DEBUG TODO
-      case 'switch-theme-berlin':
-      case 'switch-theme-bielefeld':
-      case 'switch-theme-frankfurt':
-        this.send(cmd) // Resend the command to the main process to switch theme
+      /**
+       * TAB FUNCTIONALITY
+       */
+      case 'select-next-tab':
+        this._app.getEditor().selectNextTab()
+        break
+
+      case 'select-previous-tab':
+        this._app.getEditor().selectPrevTab()
         break
 
       default:

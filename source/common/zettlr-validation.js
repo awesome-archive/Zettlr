@@ -13,7 +13,7 @@
  * END HEADER
  */
 
-const { trans } = require('../common/lang/i18n.js')
+const { trans } = require('./i18n')
 
 class ZettlrValidation {
   /**
